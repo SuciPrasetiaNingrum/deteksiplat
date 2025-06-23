@@ -1,0 +1,10 @@
+streamlit==1.35.0
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+pandas==2.2.2
+uuid==1.30
+regex==2024.4.16
+ultralytics==8.2.19
+easyocr==1.7.1
+torch==2.3.0
+Pillow==10.3.0
