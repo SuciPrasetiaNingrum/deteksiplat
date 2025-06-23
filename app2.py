@@ -4,54 +4,99 @@ import numpy as np
 import pandas as pd
 import uuid
 import re
-from datetime import datetime
+from datetime import datetime, date
 from ultralytics import YOLO
 import easyocr
 import torch
 import os
+import sqlite3
 
-# Konfigurasi awal
+# --- KONFIGURASI ANTARMUKA STREAMLIT (HARUS DIJALANKAN PERTAMA) ---
+st.set_page_config(page_title="ANPR System", layout="wide")
+st.title("🚘 Automatic Number Plate Recognition System")
+
+# --- KONFIGURASI DAN INISIALISASI ---
+
+# Konfigurasi Awal
 MODEL_PATH = "./Model_best/plat_nomor_best.pt"
+DB_PATH = "anpr_data.db"
+EVIDENCE_DIR = "data_bukti"
+
+# Pastikan folder untuk menyimpan gambar bukti ada
+os.makedirs(EVIDENCE_DIR, exist_ok=True)
 
 # Setup device CUDA jika tersedia
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Inisialisasi EasyOCR
-try:
-    reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
-except Exception as e:
-    st.error(f"Gagal memuat EasyOCR: {str(e)}")
-    st.stop()
-
-
-# Load model YOLO ke device yang sesuai
-try:
-    # Cek apakah file model ada
-    if not os.path.exists(MODEL_PATH):
-        st.error(f"File model tidak ditemukan di path: {MODEL_PATH}")
-        st.info("Pastikan file 'plat_nomor_best.pt' berada di dalam folder 'Model_best' di direktori yang sama dengan aplikasi Anda.")
+@st.cache_resource
+def load_easyocr():
+    """Memuat model EasyOCR sekali dan menyimpannya di cache."""
+    try:
+        return easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+    except Exception as e:
+        st.error(f"Gagal memuat EasyOCR: {str(e)}")
         st.stop()
-    model = YOLO(MODEL_PATH).to(DEVICE)
-except Exception as e:
-    st.error(f"Gagal memuat model YOLO: {str(e)}")
-    st.stop()
 
-# Konfigurasi antarmuka Streamlit
-st.set_page_config(page_title="ANPR System", layout="wide")
-st.title("🚘 Automatic Number Plate Recognition System")
+@st.cache_resource
+def load_yolo_model():
+    """Memuat model YOLO sekali dan menyimpannya di cache."""
+    try:
+        if not os.path.exists(MODEL_PATH):
+            st.error(f"File model tidak ditemukan di path: {MODEL_PATH}")
+            st.info("Pastikan file 'plat_nomor_best.pt' berada di dalam folder 'Model_best' di direktori yang sama dengan aplikasi Anda.")
+            st.stop()
+        return YOLO(MODEL_PATH).to(DEVICE)
+    except Exception as e:
+        st.error(f"Gagal memuat model YOLO: {str(e)}")
+        st.stop()
 
-# Sidebar untuk pengaturan
+reader = load_easyocr()
+model = load_yolo_model()
+
+def init_db():
+    """Inisialisasi database SQLite dan membuat tabel jika belum ada."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # Menghapus kolom 'arah' dari skema tabel
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS detections (
+            id TEXT PRIMARY KEY,
+            waktu TIMESTAMP,
+            plat TEXT,
+            kepercayaan_deteksi TEXT,
+            resolusi TEXT,
+            posisi TEXT,
+            status TEXT,
+            path_gambar TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+# Panggil fungsi inisialisasi database saat aplikasi dimulai
+init_db()
+
+# Inisialisasi session state
+if 'run_processing' not in st.session_state:
+    st.session_state.run_processing = False
+if 'blacklist' not in st.session_state:
+    st.session_state.blacklist = ""
+if 'whitelist' not in st.session_state:
+    st.session_state.whitelist = ""
+
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Pengaturan Sistem")
+    
+    # Tambahan: Fitur untuk memilih indeks kamera
+    camera_index = st.number_input("Indeks Kamera", min_value=0, max_value=10, value=0, step=1, help="Ubah jika Anda memiliki lebih dari satu kamera. Kamera utama biasanya 0.")
 
+    # Pengaturan Resolusi
     res_options = {
-        'HD (1280x720)': (1280, 720),
-        'Full HD (1920x1080)': (1920, 1080),
-        '480p (640x480)': (640, 480),
-        'Custom': 'custom'
+        'HD (1280x720)': (1280, 720), 'Full HD (1920x1080)': (1920, 1080),
+        '480p (640x480)': (640, 480), 'Custom': 'custom'
     }
     selected_res = st.selectbox("Resolusi Video", list(res_options.keys()))
-    
     if selected_res == 'Custom':
         custom_res = st.text_input("Masukkan resolusi (format: widthxheight)", "640x480")
         try:
@@ -61,206 +106,232 @@ with st.sidebar:
             res_width, res_height = 640, 480
     else:
         res_width, res_height = res_options[selected_res]
-    
+
+    # Pengaturan Threshold
     conf_threshold = st.slider("Threshold Deteksi (%)", 1, 100, 45) / 100
     ocr_confidence = st.slider("Threshold OCR (%)", 1, 100, 30) / 100
+    
     show_debug = st.checkbox("Tampilkan Informasi Debug")
     
     st.divider()
+    
+    # Fitur Daftar Hitam/Putih
+    st.header("🚦 Daftar Hitam & Putih")
+    st.session_state.blacklist = st.text_area("Daftar Hitam (satu plat per baris)", value=st.session_state.blacklist)
+    st.session_state.whitelist = st.text_area("Daftar Putih (satu plat per baris)", value=st.session_state.whitelist)
+
+    st.divider()
     st.markdown("**Developed by:** NADHIF & Tim")
 
-# Inisialisasi session state
-if 'detections' not in st.session_state:
-    st.session_state.detections = []
-if 'run_processing' not in st.session_state:
-    st.session_state.run_processing = False
+# --- FUNGSI-FUNGSI UTAMA ---
+PLATE_REGEX = re.compile(r'^[A-Z]{1,2}\s?(\d{1,4})\s?[A-Z]{1,3}$')
 
-# Regex untuk validasi plat nomor Indonesia (disempurnakan)
-PLATE_REGEX = re.compile(
-    r'^[A-Z]{1,2}\s?(\d{1,4})\s?[A-Z]{1,3}$'
-)
+def get_lists():
+    """Mengambil dan membersihkan daftar hitam/putih dari text area."""
+    blacklist = {line.strip().upper().replace(" ", "") for line in st.session_state.blacklist.split('\n') if line.strip()}
+    whitelist = {line.strip().upper().replace(" ", "") for line in st.session_state.whitelist.split('\n') if line.strip()}
+    return blacklist, whitelist
 
 def validate_plate(text):
     """Membersihkan dan memvalidasi teks OCR agar sesuai format plat nomor."""
     clean_text = ''.join(filter(str.isalnum, text)).upper()
-    
-    # Menghapus teks yang kemungkinan adalah tanggal STNK
-    if re.match(r'\d{4}', clean_text) or re.match(r'\d{2}\d{2}', clean_text):
-        return None
-
+    if re.match(r'\d{4}', clean_text) or re.match(r'\d{2}\d{2}', clean_text): return None
     match = PLATE_REGEX.match(clean_text)
     if match:
-        # Rekonstruksi format plat dengan spasi
         parts = re.split(r'(\d+)', clean_text)
-        if len(parts) >= 3:
-            return f"{parts[0]} {parts[1]} {''.join(parts[2:])}".strip()
-        return clean_text
+        return f"{parts[0]} {parts[1]} {''.join(parts[2:])}".strip() if len(parts) >= 3 else clean_text
     return None
 
-def resize_frame(frame, target_width, target_height):
-    """Mengubah ukuran frame dengan menjaga aspek rasio."""
-    return cv2.resize(frame, (target_width, target_height))
+def add_detection_to_db(data):
+    """Menambahkan data deteksi baru ke dalam database SQLite."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # Cek apakah plat sudah ada untuk menghindari duplikat
+    cursor.execute("SELECT id FROM detections WHERE plat = ?", (data['Plat'],))
+    existing_record = cursor.fetchone()
+
+    # Hanya insert jika plat tersebut belum pernah tercatat
+    if existing_record is None:
+        cursor.execute("""
+            INSERT INTO detections (id, waktu, plat, kepercayaan_deteksi, resolusi, posisi, status, path_gambar)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (data['ID'], data['Waktu'], data['Plat'], data['Kepercayaan Deteksi'], data['Resolusi'], data['Posisi'], data['Status'], data['Path Gambar']))
+        conn.commit()
+        conn.close()
+        return True # Mengindikasikan data baru ditambahkan
+        
+    conn.close()
+    return False # Data sudah ada
 
 def process_frame(frame, target_size):
-    """Memproses satu frame video untuk deteksi dan OCR."""
-    frame_resized = resize_frame(frame, target_size[0], target_size[1])
+    """Memproses satu frame video untuk deteksi dan OCR, serta menyimpan data."""
+    frame_resized = cv2.resize(frame, (target_size[0], target_size[1]))
     results = model(frame_resized, verbose=False, device=DEVICE)[0]
-    newly_detected_plates = []
+    blacklist, whitelist = get_lists()
     
     for box in results.boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
         conf = float(box.conf[0])
         if conf >= conf_threshold:
-            cv2.rectangle(frame_resized, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            try:
-                plate_roi = frame_resized[y1:y2, x1:x2]
-                ocr_results = reader.readtext(plate_roi, text_threshold=ocr_confidence)
-                
-                validated_plate = None
-                if ocr_results:
-                    # Coba validasi setiap hasil OCR
-                    for _, text, _ in ocr_results:
-                        plate = validate_plate(text)
-                        if plate:
-                            validated_plate = plate
-                            break # Ambil hasil valid pertama
-                    
-                    # Jika tidak ada yang valid, coba gabungkan
-                    if not validated_plate:
-                        combined_text = ' '.join([res[1] for res in ocr_results])
-                        validated_plate = validate_plate(combined_text)
+            plate_roi = frame_resized[y1:y2, x1:x2]
+            ocr_results = reader.readtext(plate_roi, text_threshold=ocr_confidence, detail=0)
 
-                if validated_plate:
-                    cv2.putText(frame_resized, validated_plate, (x1, y1-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA)
-                    
-                    # Cek apakah plat sudah terdeteksi sebelumnya
-                    if not any(d['Plat'] == validated_plate for d in st.session_state.detections):
-                        detection_data = {
-                            'ID': str(uuid.uuid4())[:6],
-                            'Waktu': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            'Plat': validated_plate,
-                            'Kepercayaan Deteksi': f"{conf:.2%}",
-                            'Resolusi': f"{target_size[0]}x{target_size[1]}",
-                            'Posisi': f"({x1},{y1}) - ({x2},{y2})"
-                        }
-                        newly_detected_plates.append(detection_data)
-            except Exception as e:
-                if show_debug:
-                    st.warning(f"Error processing ROI: {str(e)}")
-    
-    if newly_detected_plates:
-        st.session_state.detections.extend(newly_detected_plates)
-    
+            validated_plate = None
+            if ocr_results:
+                combined_text = ' '.join(ocr_results)
+                for text in ocr_results + [combined_text]:
+                    plate = validate_plate(text)
+                    if plate:
+                        validated_plate = plate
+                        break
+            
+            box_color = (0, 255, 0) # Hijau
+            status = "Normal"
+
+            if validated_plate:
+                plate_no_space = validated_plate.replace(" ", "")
+                if plate_no_space in blacklist:
+                    status = "Blacklist"
+                    box_color = (0, 0, 255) # Merah
+                elif plate_no_space in whitelist:
+                    status = "Whitelist"
+                    box_color = (255, 0, 0) # Biru
+
+                cv2.rectangle(frame_resized, (x1, y1), (x2, y2), box_color, 2)
+                cv2.putText(frame_resized, f"{validated_plate} [{status}]", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, box_color, 2, cv2.LINE_AA)
+                
+                timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                img_filename = f"{validated_plate.replace(' ', '_')}_{timestamp_str}.jpg"
+                img_path = os.path.join(EVIDENCE_DIR, img_filename)
+                
+                # Menghapus 'Arah' dari dictionary data
+                detection_data = {
+                    'ID': str(uuid.uuid4())[:8], 'Waktu': datetime.now(), 'Plat': validated_plate,
+                    'Kepercayaan Deteksi': f"{conf:.2%}", 'Resolusi': f"{target_size[0]}x{target_size[1]}",
+                    'Posisi': f"({x1},{y1})-({x2},{y2})", 'Status': status, 'Path Gambar': img_path
+                }
+
+                if add_detection_to_db(detection_data):
+                    cv2.imwrite(img_path, plate_roi) 
+                    if status == "Blacklist":
+                        st.toast(f"🚨 PERINGATAN: Kendaraan Daftar Hitam terdeteksi! Plat: {validated_plate}", icon="🚨")
+
     return frame_resized
 
-# --- MAIN LAYOUT ---
+def fetch_data(search_query=None, start_date=None, end_date=None):
+    """Mengambil data dari database dengan filter."""
+    conn = sqlite3.connect(DB_PATH)
+    # Menghapus 'arah' dari query SELECT
+    query = "SELECT id, waktu, plat, status, kepercayaan_deteksi, path_gambar FROM detections"
+    conditions = []
+    params = []
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    video_source = st.radio("Pilih Sumber Video:", 
-                            ("Webcam", "Upload Video"), 
-                            horizontal=True, key="video_source_selector")
+    if search_query:
+        conditions.append("plat LIKE ?")
+        params.append(f"%{search_query}%")
+    if start_date:
+        conditions.append("waktu >= ?")
+        params.append(start_date.strftime("%Y-%m-%d 00:00:00"))
+    if end_date:
+        conditions.append("waktu <= ?")
+        params.append(end_date.strftime("%Y-%m-%d 23:59:59"))
 
-with col2:
-    if st.button("🔄 Reset Deteksi"):
-        st.session_state.detections = []
-        st.rerun() # FIX: Menggunakan st.rerun() yang modern
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    
+    query += " ORDER BY waktu DESC"
+    
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
 
+def style_df(df):
+    """Memberi warna pada baris dataframe berdasarkan status."""
+    def apply_style(row):
+        color = ''
+        if row.status == 'Blacklist':
+            color = 'background-color: #ffcccc'
+        elif row.status == 'Whitelist':
+            color = 'background-color: #cceeff'
+        return [color] * len(row)
+    
+    return df.style.apply(apply_style, axis=1)
+
+# --- LAYOUT UTAMA ---
+video_source = st.radio("Pilih Sumber Video:", ("Webcam", "Upload Video"), horizontal=True, key="video_source_selector")
 video_placeholder = st.empty()
-data_placeholder = st.empty()
 
-# FIX: Inisialisasi cap ke None
-cap = None 
-
+cap = None
 if video_source == "Webcam":
-    try:
-        cap = cv2.VideoCapture(0) # Menggunakan indeks 0 untuk webcam default
-        if not cap.isOpened():
-            st.error("Gagal mengakses webcam. Pastikan webcam terhubung dan tidak digunakan oleh aplikasi lain.")
-            st.session_state.run_processing = False
-        else:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, res_width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, res_height)
-            st.session_state.run_processing = True
-    except Exception as e:
-        st.error(f"Error saat membuka webcam: {e}")
-        st.session_state.run_processing = False
-
+    # Menggunakan nilai dari widget indeks kamera
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        st.error(f"Gagal mengakses kamera dengan indeks {camera_index}. Pastikan kamera terhubung dan tidak digunakan oleh aplikasi lain.")
+    else:
+        st.session_state.run_processing = True
 elif video_source == "Upload Video":
     uploaded_file = st.file_uploader("Upload file video", type=["mp4", "avi", "mov", "mkv"])
     if uploaded_file:
-        # Simpan file yang di-upload ke file sementara
         temp_file_path = os.path.join(".", uploaded_file.name)
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
+        with open(temp_file_path, "wb") as f: f.write(uploaded_file.getbuffer())
         cap = cv2.VideoCapture(temp_file_path)
         st.session_state.run_processing = True
-    else:
-        st.session_state.run_processing = False
-        video_placeholder.info("Silakan upload file video untuk memulai pemrosesan.")
 
-# Loop pemrosesan utama
-while st.session_state.run_processing and cap and cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        st.success("Pemrosesan video selesai!")
-        st.session_state.run_processing = False
-        break
-    
-    processed_frame = process_frame(frame, (res_width, res_height))
-    # Konversi BGR (OpenCV) ke RGB (Streamlit)
-    video_placeholder.image(processed_frame[:, :, ::-1], 
-                            channels="RGB", 
-                            use_container_width=True)
-    
-    if st.session_state.detections:
-        # Tampilkan data unik terakhir berdasarkan plat
-        df = pd.DataFrame(st.session_state.detections).drop_duplicates('Plat', keep='last')
-        data_placeholder.dataframe(
-            df[['ID', 'Waktu', 'Plat', 'Kepercayaan Deteksi', 'Resolusi']],
-            height=300,
-            use_container_width=True
-        )
+if st.session_state.run_processing and cap:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            st.success("Pemrosesan video selesai!")
+            st.session_state.run_processing = False
+            st.rerun()
+            break
+        processed_frame = process_frame(frame, (res_width, res_height))
+        video_placeholder.image(processed_frame[:, :, ::-1], channels="RGB", use_container_width=True)
+else:
+    video_placeholder.info("Sistem siap. Pilih sumber video atau upload file untuk memulai.")
 
-# --- CLEANUP AND FINAL ACTIONS ---
-
-# FIX: Lakukan release hanya jika cap telah diinisialisasi
 if cap is not None:
     cap.release()
 
-# Tombol download akan selalu muncul jika ada data
-if st.session_state.detections:
-    # Hapus duplikat sebelum download
-    final_df = pd.DataFrame(st.session_state.detections).drop_duplicates('Plat', keep='last')
-    csv = final_df.to_csv(index=False).encode('utf-8')
+st.divider()
+
+# --- AREA DATA DAN FILTER ---
+st.header("📜 Data Kendaraan Tercatat")
+filter1, filter2, filter3 = st.columns([2, 1, 1])
+with filter1:
+    search_term = st.text_input("Cari Plat Nomor", placeholder="Masukkan sebagian atau seluruh plat...")
+with filter2:
+    start_date_filter = st.date_input("Dari Tanggal", value=None)
+with filter3:
+    end_date_filter = st.date_input("Sampai Tanggal", value=None)
+
+df_detections = fetch_data(search_term, start_date_filter, end_date_filter)
+
+if not df_detections.empty:
+    st.dataframe(style_df(df_detections), use_container_width=True)
+    
+    csv = df_detections.to_csv(index=False).encode('utf-8')
     st.download_button(
-        label="📥 Download Data CSV",
+        label="📥 Download Data (CSV)",
         data=csv,
         file_name=f"deteksi_plat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv"
     )
+else:
+    st.info("Tidak ada data yang cocok dengan filter saat ini.")
 
-# Tampilkan informasi debug jika dicentang
+# --- AREA DEBUG ---
 if show_debug:
     st.subheader("ℹ️ Informasi Debug")
-    debug_col1, debug_col2 = st.columns(2)
-    with debug_col1:
-        st.markdown("**Status Sistem:**")
-        # FIX: Cek apakah cap isOpened sebelum mengakses propertinya
-        is_cap_opened = cap and cap.isOpened() if cap else False
-        st.json({
-            "Resolusi Aktif": f"{res_width}x{res_height}",
-            "Total Deteksi Unik": len(pd.DataFrame(st.session_state.detections).drop_duplicates('Plat')),
-            "FPS (Sumber)": f"{cap.get(cv2.CAP_PROP_FPS):.2f}" if is_cap_opened else "N/A",
-            "Device": DEVICE
-        })
+    db_conn = sqlite3.connect(DB_PATH)
+    total_records = pd.read_sql_query("SELECT COUNT(*) FROM detections", db_conn).iloc[0,0]
+    db_conn.close()
     
-    with debug_col2:
-        st.markdown("**Konfigurasi Kamera:**")
-        is_cap_opened = cap and cap.isOpened() if cap else False
-        st.json({
-            "Frame Width (Actual)": cap.get(cv2.CAP_PROP_FRAME_WIDTH) if is_cap_opened else "N/A",
-            "Frame Height (Actual)": cap.get(cv2.CAP_PROP_FRAME_HEIGHT) if is_cap_opened else "N/A"
-        })
+    st.json({
+        "Resolusi Aktif": f"{res_width}x{res_height}",
+        "Total Catatan di DB": total_records,
+        "Device": DEVICE,
+        "Daftar Hitam Aktif": list(get_lists()[0]),
+        "Daftar Putih Aktif": list(get_lists()[1])
+    })
